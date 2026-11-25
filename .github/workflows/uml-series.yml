@@ -1,0 +1,194 @@
+name: UML CI
+run-name: UML · ${{ inputs.patch_title || 'patch' }}${{ inputs.inbox_key && format(' · {0}', inputs.inbox_key) || '' }}
+on:
+  workflow_dispatch:
+    inputs:
+      message_id:
+        description: linux-um cover letter or single-patch Message-ID
+        required: true
+        type: string
+      patch_title:
+        description: Short patch or cover-letter subject for the run list
+        type: string
+      inbox_key:
+        description: Automatic dispatch identifier (leave empty for manual runs)
+        type: string
+      base_sha:
+        description: Full UML commit SHA (defaults to upstream next)
+        type: string
+
+permissions:
+  contents: read
+env:
+  UPSTREAM: https://git.kernel.org/pub/scm/linux/kernel/git/uml/linux.git
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.base.outputs.sha }}
+      reply: ${{ steps.mail.outputs.reply }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - id: base
+        env:
+          SHA: ${{ inputs.base_sha }}
+        run: |
+          if [[ -z $SHA ]]; then
+            SHA=$(git ls-remote --exit-code "$UPSTREAM" refs/heads/next | cut -f1)
+          fi
+          [[ $SHA =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+      - name: Fetch series
+        id: mail
+        env:
+          MID: ${{ inputs.message_id }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y b4
+          bash ci/tools/series.sh "$MID"
+          echo "reply=$(base64 -w0 reply.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: series
+          path: series.mbox
+
+  checkpatch:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    env:
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: |
+          bash ci/tools/checkout.sh
+          # Resolve abbreviated Fixes tags against the base commit's ancestry.
+          git -C linux fetch --no-tags --filter=tree:0 --unshallow \
+            https://github.com/kernelorg-mirror/linux_kernel_git_uml_linux "$SHA"
+      - uses: actions/download-artifact@v8
+        with:
+          name: series
+      - name: Check each patch
+        run: bash ci/tools/checkpatch.sh
+
+  apply:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    env:
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: bash ci/tools/checkout.sh
+      - uses: actions/download-artifact@v8
+        with:
+          name: series
+      - name: Apply series
+        run: |
+          export GIT_COMMITTER_DATE="$(git -C linux show -s --format=%cI HEAD)"
+          git -C linux -c user.name=CI -c user.email=ci@localhost am ../series.mbox
+      - name: Bundle applied commits
+        run: git -C linux bundle create ../patched.bundle HEAD "^$SHA"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: patched
+          path: patched.bundle
+          retention-days: 1
+
+  build:
+    needs: [prepare, apply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    name: build / ${{ matrix.mode }}
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [mmu, nommu]
+    env:
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Checkout kernel
+        run: bash ci/tools/checkout.sh
+      - uses: actions/download-artifact@v8
+        with:
+          name: patched
+      - name: Checkout applied commits
+        run: |
+          git -C linux fetch ../patched.bundle HEAD
+          git -C linux checkout -q --detach FETCH_HEAD
+      - name: Build kernel and rootfs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y flex bison libelf-dev libssl-dev bc musl-tools
+          bash ci/tools/build.sh "${{ matrix.mode }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ matrix.mode }}
+          path: |
+            build/linux
+            root.ext4
+            release
+          retention-days: 1
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: build-${{ matrix.mode }}
+          path: results/
+
+  boot:
+    needs: [apply, build]
+    if: ${{ !cancelled() && needs.apply.result == 'success' && needs.build.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    name: ${{ matrix.mode }} / ${{ matrix.backend }} / ${{ matrix.clock }}
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [mmu, nommu]
+        backend: [ptrace, seccomp]
+        clock: [normal, basic, inf-cpu, ext]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: image-${{ matrix.mode }}
+      - name: Boot guest and run tests
+        run: bash ci/tools/boot.sh "${{ matrix.mode }}" "${{ matrix.backend }}" "${{ matrix.clock }}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ${{ matrix.mode }}-${{ matrix.backend }}-${{ matrix.clock }}
+          path: results/
+
+  report:
+    name: Report summary
+    needs: [prepare, apply, checkpatch, build, boot]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Summarize jobs
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+          MID: ${{ inputs.message_id }}
+          REPLY: ${{ needs.prepare.outputs.reply }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" > jobs.json
+          bash ci/tools/report.sh jobs.json >> "$GITHUB_STEP_SUMMARY"
+          bash ci/tools/reply-preview.sh jobs.json >> "$GITHUB_STEP_SUMMARY"

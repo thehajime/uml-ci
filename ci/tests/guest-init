@@ -1,0 +1,25 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+status=PASS
+for test in /tests/*.sh; do
+	if "$test"; then
+		echo "PASS ${test##*/}"
+	else
+		echo "FAIL ${test##*/}"
+		status=FAIL
+	fi
+done
+if /smoke; then
+	if ! /vdso-clock "$1"; then
+		echo 'FAIL vdso-clock'
+		status=FAIL
+	elif [ -x /vdso-test ] && ! /vdso-test; then
+		echo 'FAIL vdso-test'
+		status=FAIL
+	fi
+else
+	status=FAIL
+fi
+read -r release < /proc/sys/kernel/osrelease
+echo "UML-CI $release $status"
+/bin/busybox poweroff -f
