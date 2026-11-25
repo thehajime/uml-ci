@@ -2,9 +2,14 @@ name: Schedule probe
 on:
   schedule:
     - cron: '*/5 * * * *'
+    - cron: '49 * * * *'
 permissions: {}
 jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - run: date -u
+      - env:
+          TRIGGER_CRON: ${{ github.event.schedule }}
+        run: |
+          echo "Triggered by $TRIGGER_CRON"
+          date -u
