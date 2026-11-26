@@ -10,7 +10,10 @@ result() {
 	      if . then " (" + . + ")" else "" end)
 	  end' "$jobs"
 }
-printf 'Series `%s` · base `%s`\n\n' "$MID" "$SHA"
+mid=${MID#<}
+mid=${mid%>}
+encoded=$(jq -rn --arg mid "$mid" '$mid | @uri')
+printf '[Patch on lore](https://lore.kernel.org/linux-um/%s/) · base `%s`\n\n' "$encoded" "$SHA"
 printf 'Apply %s · ' "$(result apply)"
 printf 'Checkpatch %s\n' "$(result checkpatch)"
 if ! jq -e 'any(.jobs[]; .name == "apply" and .conclusion == "success")' "$jobs" >/dev/null; then
